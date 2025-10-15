@@ -386,17 +386,19 @@ def _heuristic_classify_digit(feats: Dict[str, float]) -> str:
         return "8"
     # One hole: could be 0, 4, 6 or 9
     if holes == 1:
-        # If hole position is defined, use it to distinguish 6, 9 and 0
+        # If the hole's vertical position is known, use it first to decide
         hole_pos = feats.get("hole_pos", float("nan"))
         if not np.isnan(hole_pos):
+            # A hole near the top indicates a 9
             if hole_pos < 0.4:
                 return "9"
-            if hole_pos > 0.6:
+            # A hole near the bottom indicates a 6
+            if hole_pos > 0.55:
                 return "6"
-        # 4 tends to be wide
+        # A very wide shape with one hole is likely a 4
         if aspect > 0.72:
             return "4"
-        # Fallback: 9 is slightly denser overall than 0
+        # Otherwise fall back to density: denser shapes tend to be 9, sparse are 0
         if fill > 0.63:
             return "9"
         return "0"
@@ -618,18 +620,21 @@ def main() -> None:
         # each row will be numbered sequentially starting from this value,
         # overriding automatic recognition.  This can be used as a
         # fallback when OCR fails on some pages.
+        # Sequential start number for numbering tasks across pages.  If provided,
+        # numbering will begin at this value and increment for each detected row,
+        # overriding automatic OCR-based numbering entirely.  If left empty,
+        # numbering defaults to 1.
         start_num_input = st.text_input(
-            "Startnummer (optional, falls automatische Erkennung fehlschlägt)", value=""
+            "Startnummer der ersten Aufgabe (Standard: 1)", value="1"
         )
-        start_num_int: Optional[int] = None
-        if start_num_input.strip():
-            try:
-                start_num_int = int(start_num_input.strip())
-            except ValueError:
-                st.warning(
-                    "⚠️ 'Startnummer' muss eine Zahl sein. Ignoriere Eingabe für Startnummer."
-                )
-                start_num_int = None
+        start_num_int: int = 1
+        try:
+            start_num_int = int(start_num_input.strip()) if start_num_input.strip() else 1
+        except ValueError:
+            st.warning(
+                "⚠️ 'Startnummer' muss eine Zahl sein. Verwende Standardwert 1."
+            )
+            start_num_int = 1
         uploaded_files = st.file_uploader(
             "Seiten als Bilder hochladen",
             type=["png", "jpg", "jpeg", "webp"],
@@ -642,6 +647,8 @@ def main() -> None:
             st.error("Bitte mindestens ein Bild hochladen.")
             st.stop()
         out_imgs: List[Tuple[str, np.ndarray]] = []
+        # Use a global counter to number tasks sequentially across all pages.
+        global_counter = 0
         for uf in uploaded_files:
             img = load_cv2_image(uf)
             # Extract rows and recognised numbers
@@ -653,22 +660,16 @@ def main() -> None:
                 margin_vertical=20,
                 margin_horizontal=40,
             )
-            for idx, (crop, number) in enumerate(rows, start=1):
+            for (crop, number) in rows:
                 # Normalise the test name for filenames
                 safe_test = untertest.replace(" ", "_")
                 safe_set = set_text.replace(" ", "_")
-                # Determine task identifier: either sequential from start_num_int
-                # or the recognised number (if not containing '?').  If both
-                # are unavailable, fall back to index.
-                task_id: Optional[str] = None
-                if start_num_int is not None:
-                    task_id = f"{start_num_int + idx - 1:02d}"
-                elif number and '?' not in number:
-                    task_id = number
-                else:
-                    task_id = f"{idx:02d}"
+                # Assign sequential task numbers starting from start_num_int
+                task_number = start_num_int + global_counter
+                task_id = f"{task_number:02d}"
                 filename = f"{safe_test}_Set-{safe_set}_Task-{task_id}_Solution.png"
                 out_imgs.append((filename, crop))
+                global_counter += 1
         if not out_imgs:
             st.warning("Keine Reihen erkannt. Prüfe das Layout und versuche es erneut.")
         else:
