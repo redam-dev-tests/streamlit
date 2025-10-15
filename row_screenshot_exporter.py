@@ -26,6 +26,7 @@ robust to variations in scan contrast or white balance.
 
 import io
 import zipfile
+import os
 from datetime import datetime
 from typing import List, Tuple, Optional, Dict
 
@@ -40,6 +41,101 @@ def load_cv2_image(file) -> np.ndarray:
     img_arr = np.frombuffer(bytes_data, dtype=np.uint8)
     img = cv2.imdecode(img_arr, cv2.IMREAD_COLOR)
     return img
+
+# -----------------------------------------------------------------------------
+# Template loading for digit classification
+#
+# We attempt to improve digit recognition by comparing each detected digit
+# against a set of template masks extracted from sample pages.  At import
+# time we load any available templates from files named ``template_<digit>.png``
+# located alongside this script.  Each template is thresholded to a binary
+# mask and cropped to its bounding box.  These templates are later used
+# in a simple normalized cross-correlation to identify the digit with
+# highest similarity.
+
+def _load_template_masks() -> Dict[str, np.ndarray]:
+    """Load available digit templates from disk.
+
+    The script looks for files named ``template_<d>.png`` for d in
+    ``0123456789`` in the same directory as this module.  For each
+    existing file it reads the image, thresholds out the yellow digit
+    region using :func:`_threshold_digit_mask` and crops to the
+    bounding box of non-zero pixels.  The resulting binary mask is
+    stored in the returned dictionary keyed by the digit string.
+
+    Returns
+    -------
+    Dict[str, np.ndarray]
+        Mapping from digit characters to boolean masks of that digit.
+    """
+    templates: Dict[str, np.ndarray] = {}
+    here = os.path.abspath(os.path.dirname(__file__))
+    for d in "0123456789":
+        fname = os.path.join(here, f"template_{d}.png")
+        if not os.path.exists(fname):
+            continue
+        try:
+            img = cv2.imread(fname, cv2.IMREAD_COLOR)
+            if img is None:
+                continue
+            mask = _threshold_digit_mask(img)
+            # Crop to bounding box
+            ys, xs = np.where(mask > 0)
+            if ys.size == 0 or xs.size == 0:
+                continue
+            y0, y1 = ys.min(), ys.max() + 1
+            x0, x1 = xs.min(), xs.max() + 1
+            crop = mask[y0:y1, x0:x1].astype(np.uint8)
+            # Normalize to 0/1
+            crop = (crop > 0).astype(np.uint8)
+            templates[d] = crop
+        except Exception:
+            continue
+    return templates
+
+# Load templates once at import time
+TEMPLATE_MASKS: Dict[str, np.ndarray] = _load_template_masks()
+
+def _match_template_digit(mask: np.ndarray) -> Tuple[str, float]:
+    """Match a candidate digit mask against loaded templates.
+
+    Parameters
+    ----------
+    mask : np.ndarray
+        Binary (uint8) mask of the candidate digit after cropping to
+        its bounding box.
+
+    Returns
+    -------
+    Tuple[str, float]
+        The recognised digit (or '?' if no template match is strong)
+        and the corresponding similarity score (0–1).  If no
+        templates are loaded, the digit is returned as '?' with score 0.
+    """
+    best_digit = "?"
+    best_score = 0.0
+    if not TEMPLATE_MASKS:
+        return best_digit, best_score
+    # Flatten candidate mask to ensure values 0/1
+    cand = mask.astype(np.float32)
+    cand /= (cand.max() + 1e-6)
+    # We will compare the candidate against each template by resizing
+    # the candidate to the template dimensions and computing a
+    # normalized correlation: sum(c * t) / sqrt(sum(c^2) * sum(t^2)).
+    for digit, tmpl in TEMPLATE_MASKS.items():
+        # Resize candidate to match template size
+        resized = cv2.resize(cand, (tmpl.shape[1], tmpl.shape[0]), interpolation=cv2.INTER_AREA)
+        # Normalize resized to 0/1 range
+        if resized.max() > 0:
+            resized = resized / resized.max()
+        # Compute dot product and norms
+        dot = float((resized * tmpl).sum())
+        denom = float(np.sqrt((resized * resized).sum() * (tmpl * tmpl).sum()))
+        score = dot / denom if denom > 0 else 0.0
+        if score > best_score:
+            best_score = score
+            best_digit = digit
+    return best_digit, best_score
 
 
 def detect_row_anchors(img: np.ndarray) -> List[Tuple[int, int, int, int]]:
@@ -243,14 +339,12 @@ def _digit_features(digit_img: np.ndarray) -> Dict[str, float]:
     }
 
 
-def _classify_digit(feats: Dict[str, float]) -> str:
-    """Classify a digit based on heuristic shape features.
+def _heuristic_classify_digit(feats: Dict[str, float]) -> str:
+    """Classify a digit using simple shape heuristics.
 
-    This function uses the results of :func:`_digit_features` to
-    distinguish between numerals 0–9 as they appear in the test
-    material.  The decision logic was calibrated on the provided
-    questionnaire pages.  If a digit cannot be confidently
-    classified, a question mark ("?") is returned.
+    This fallback classifier distinguishes digits based on the
+    feature vector returned by :func:`_digit_features`.  It is used
+    when template matching fails to confidently recognise the digit.
 
     Parameters
     ----------
@@ -279,7 +373,7 @@ def _classify_digit(feats: Dict[str, float]) -> str:
         if ratio < 0.45:
             return "6"
         # Between 0 and 9: 9 is slightly denser
-        if fill > 0.67:
+        if fill > 0.66:
             return "9"
         else:
             return "0"
@@ -300,9 +394,54 @@ def _classify_digit(feats: Dict[str, float]) -> str:
     # Otherwise default to 3
     return "3"
 
+def _classify_digit_image(digit_img: np.ndarray) -> str:
+    """Classify a single digit subimage using template matching and heuristics.
+
+    This function first thresholds and crops the digit to obtain a
+    binary mask and then attempts to match it against preloaded
+    templates using :func:`_match_template_digit`.  If the best
+    matching score exceeds a moderate threshold (0.55), the
+    corresponding digit is returned.  Otherwise, shape features are
+    computed via :func:`_digit_features` and a heuristic classifier
+    is used as a fallback.
+
+    Parameters
+    ----------
+    digit_img : np.ndarray
+        BGR image containing exactly one digit.
+
+    Returns
+    -------
+    str
+        The recognised digit (0–9) or '?' if classification fails.
+    """
+    # Threshold the digit region to isolate yellow pixels
+    mask = _threshold_digit_mask(digit_img)
+    # Find bounding box of non-zero mask
+    ys, xs = np.where(mask > 0)
+    if ys.size == 0 or xs.size == 0:
+        return "?"
+    y0, y1 = ys.min(), ys.max() + 1
+    x0, x1 = xs.min(), xs.max() + 1
+    submask = (mask[y0:y1, x0:x1] > 0).astype(np.uint8)
+    # Template matching
+    digit_tm, score = _match_template_digit(submask)
+    # If the best template match is reasonably confident, use it
+    if score >= 0.55 and digit_tm != "?":
+        return digit_tm
+    # Otherwise fall back to shape-based heuristics
+    feats = _digit_features(digit_img)
+    return _heuristic_classify_digit(feats)
+
 
 def read_task_number(region: np.ndarray) -> str:
     """Read the numeric label from a detected task row anchor.
+
+    This function extracts all digit subimages from the grey number box,
+    classifies each one individually using template matching and
+    heuristics via :func:`_classify_digit_image` and concatenates
+    their recognised characters.  If no digits are detected, a
+    question mark ("?") is returned.
 
     Parameters
     ----------
@@ -313,15 +452,15 @@ def read_task_number(region: np.ndarray) -> str:
     -------
     str
         The recognised number as a string.  If the digits cannot be
-        confidently parsed, a sequence of '?' will be returned.
+        confidently parsed, a sequence of '?' characters will be
+        returned.
     """
-    digits = _extract_digit_images(region)
-    if not digits:
+    digit_imgs = _extract_digit_images(region)
+    if not digit_imgs:
         return "?"
     num_str = ""
-    for dimg in digits:
-        feats = _digit_features(dimg)
-        num_str += _classify_digit(feats)
+    for dimg in digit_imgs:
+        num_str += _classify_digit_image(dimg)
     return num_str
 
 
