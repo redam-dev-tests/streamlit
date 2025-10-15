@@ -415,8 +415,24 @@ def _classify_digit_image(digit_img: np.ndarray) -> str:
     str
         The recognised digit (0–9) or '?' if classification fails.
     """
-    # Threshold the digit region to isolate yellow pixels
-    mask = _threshold_digit_mask(digit_img)
+    # Optionally enhance contrast of the digit region using CLAHE.
+    # This improves robustness when scans are low-contrast.  We apply
+    # adaptive histogram equalisation to the lightness channel in the
+    # LAB colour space.
+    try:
+        lab = cv2.cvtColor(digit_img, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        # Clip limit and tileGridSize tuned for small glyphs
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4))
+        l = clahe.apply(l)
+        lab = cv2.merge((l, a, b))
+        preproc_img = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+    except Exception:
+        # Fallback to original if colour conversion fails
+        preproc_img = digit_img
+
+    # Threshold the (preprocessed) digit region to isolate yellow pixels
+    mask = _threshold_digit_mask(preproc_img)
     # Find bounding box of non-zero mask
     ys, xs = np.where(mask > 0)
     if ys.size == 0 or xs.size == 0:
@@ -427,7 +443,7 @@ def _classify_digit_image(digit_img: np.ndarray) -> str:
     # Template matching
     digit_tm, score = _match_template_digit(submask)
     # If the best template match is reasonably confident, use it
-    if score >= 0.55 and digit_tm != "?":
+    if score >= 0.45 and digit_tm != "?":
         return digit_tm
     # Otherwise fall back to shape-based heuristics
     feats = _digit_features(digit_img)
