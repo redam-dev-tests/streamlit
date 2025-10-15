@@ -360,60 +360,76 @@ def _digit_features(digit_img: np.ndarray) -> Dict[str, float]:
 
 
 def _heuristic_classify_digit(feats: Dict[str, float]) -> str:
-    """Classify a digit using simple shape heuristics.
+    """
+    Classify a digit based on simple geometric heuristics.
 
-    This fallback classifier distinguishes digits based on the
-    feature vector returned by :func:`_digit_features`.  It is used
-    when template matching fails to confidently recognise the digit.
+    This classifier uses the number of holes, the aspect ratio, the
+    distribution of pixel mass (ratio of top vs bottom), and the
+    estimated vertical position of any hole to distinguish digits.  It
+    has been tuned on the user's data to robustly separate 0 from 9
+    and 6, and to improve discrimination between 2, 3 and 5.
 
     Parameters
     ----------
     feats : Dict[str, float]
-        Feature dictionary with keys ``holes``, ``aspect``, ``fill`` and
-        ``ratio``.
+        Dictionary of features as returned by ``_digit_features``.
 
     Returns
     -------
     str
-        The recognised digit as a string.
+        Recognised digit (0–9) or '?' if classification fails.
     """
-    holes = feats["holes"]
-    aspect = feats["aspect"]
-    fill = feats["fill"]
-    ratio = feats["ratio"]
-    # Two holes: must be an 8
+    holes = feats.get("holes", 0.0)
+    aspect = feats.get("aspect", 0.0)
+    fill = feats.get("fill", 0.0)
+    ratio = feats.get("ratio", 0.0)
+    hole_pos = feats.get("hole_pos", float("nan"))
+
+    # Two holes -> 8
     if holes >= 2:
         return "8"
+
     # One hole: could be 0, 4, 6 or 9
     if holes == 1:
-        # If the hole's vertical position is known, use it first to decide
-        hole_pos = feats.get("hole_pos", float("nan"))
+        # When the hole's vertical position is known, prioritise it
         if not np.isnan(hole_pos):
-            # A hole near the top indicates a 9
-            if hole_pos < 0.4:
+            # Hole near top -> 9
+            if hole_pos <= 0.45:
                 return "9"
-            # A hole near the bottom indicates a 6
-            if hole_pos > 0.55:
+            # Hole near bottom -> 6
+            if hole_pos >= 0.55:
                 return "6"
-        # A very wide shape with one hole is likely a 4
-        if aspect > 0.72:
+            # Hole centrally positioned: could be 0 or 4 depending on width
+            # A relatively wide digit with a central hole is a 4
+            if aspect > 0.70:
+                return "4"
+            # Otherwise treat as 0
+            return "0"
+        # Fallback when hole_pos isn't available (e.g. noisy segmentation)
+        # Use width to detect 4
+        if aspect > 0.70:
             return "4"
-        # Otherwise fall back to density: denser shapes tend to be 9, sparse are 0
-        if fill > 0.63:
+        # Use the mass distribution as a fallback: bottom-heavy indicates 6
+        if ratio < 0.50:
+            return "6"
+        # Top-heavy or dense shape tends to be 9
+        if ratio > 0.56:
             return "9"
+        # Otherwise default to 0
         return "0"
-    # No holes: 1, 2, 3, 5 or 7
-    # Very slender => 1
+
+    # No holes: could be 1, 2, 3, 5 or 7
+    # Very slender shapes are 1
     if aspect < 0.50:
         return "1"
-    # Top heavy => 7
-    if ratio > 0.65:
+    # Top-heavy shapes are 7
+    if ratio > 0.62:
         return "7"
-    # Distinguish 5 using slightly higher top ratio
-    if ratio > 0.54:
+    # Identify 5: either moderately top heavy or sufficiently dense overall
+    if ratio >= 0.51 or fill >= 0.62:
         return "5"
-    # Distinguish 2: lower top ratio implies 2
-    if ratio < 0.49:
+    # Distinguish 2: 2 tends to have a larger fill than 3 but not as much as 5
+    if fill > 0.58:
         return "2"
     # Otherwise default to 3
     return "3"
@@ -647,7 +663,7 @@ def main() -> None:
             st.error("Bitte mindestens ein Bild hochladen.")
             st.stop()
         out_imgs: List[Tuple[str, np.ndarray]] = []
-        # Use a global counter to number tasks sequentially across all pages.
+        # Use a global counter to support fallback numbering across all pages.
         global_counter = 0
         for uf in uploaded_files:
             img = load_cv2_image(uf)
@@ -664,11 +680,16 @@ def main() -> None:
                 # Normalise the test name for filenames
                 safe_test = untertest.replace(" ", "_")
                 safe_set = set_text.replace(" ", "_")
-                # Assign sequential task numbers starting from start_num_int
-                task_number = start_num_int + global_counter
-                task_id = f"{task_number:02d}"
+                # Determine task identifier: prefer recognised number when valid, otherwise fallback
+                if number and '?' not in number and number.isdigit():
+                    # Zero-pad to at least 2 digits (e.g. '1' -> '01')
+                    task_id = number.zfill(2)
+                else:
+                    task_number = start_num_int + global_counter
+                    task_id = f"{task_number:02d}"
                 filename = f"{safe_test}_Set-{safe_set}_Task-{task_id}_Solution.png"
                 out_imgs.append((filename, crop))
+                # Increment global counter after each row so fallback numbering stays in order
                 global_counter += 1
         if not out_imgs:
             st.warning("Keine Reihen erkannt. Prüfe das Layout und versuche es erneut.")
