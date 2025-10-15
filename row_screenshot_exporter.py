@@ -331,11 +331,31 @@ def _digit_features(digit_img: np.ndarray) -> Dict[str, float]:
     top = mask[: h // 2].sum() / 255.0
     bottom = mask[h // 2 :].sum() / 255.0
     ratio = top / (top + bottom) if (top + bottom) > 0 else 0.0
+    # Estimate the vertical position of any hole relative to the full digit.
+    hole_pos: Optional[float] = None
+    if holes == 1 and hierarchy is not None:
+        # Find the hole contour and compute its vertical centroid
+        # relative to the bounding box of the digit
+        ys_all, xs_all = np.where(mask > 0)
+        if ys_all.size > 0:
+            y_min, y_max = ys_all.min(), ys_all.max()
+            total_height = y_max - y_min if (y_max - y_min) > 0 else 1
+            positions: List[float] = []
+            for idx, cnt in enumerate(contours):
+                parent = hierarchy[0][idx][3]
+                # If the contour has a parent (hole) and the parent is an outer contour
+                if parent != -1 and hierarchy[0][parent][3] == -1:
+                    xh, yh, wh, hh = cv2.boundingRect(cnt)
+                    cy = yh + hh / 2.0
+                    positions.append((cy - y_min) / total_height)
+            if positions:
+                hole_pos = float(np.mean(positions))
     return {
         "holes": float(holes),
         "aspect": float(aspect),
         "fill": float(fill),
         "ratio": float(ratio),
+        "hole_pos": hole_pos if hole_pos is not None else float('nan'),
     }
 
 
@@ -366,13 +386,17 @@ def _heuristic_classify_digit(feats: Dict[str, float]) -> str:
         return "8"
     # One hole: could be 0, 4, 6 or 9
     if holes == 1:
+        # If hole position is defined, use it to distinguish 6, 9 and 0
+        hole_pos = feats.get("hole_pos", float("nan"))
+        if not np.isnan(hole_pos):
+            if hole_pos < 0.4:
+                return "9"
+            if hole_pos > 0.6:
+                return "6"
         # 4 tends to be wide
         if aspect > 0.72:
             return "4"
-        # 6 usually has a heavier lower half; ratio lower than ~0.50
-        if ratio < 0.50:
-            return "6"
-        # 9 is slightly denser overall than 0; empirically fill above ~0.63
+        # Fallback: 9 is slightly denser overall than 0
         if fill > 0.63:
             return "9"
         return "0"
@@ -590,6 +614,22 @@ def main() -> None:
             except ValueError:
                 st.warning("⚠️ 'Anzahl Aufgaben' muss eine Zahl sein. Ignoriere Eingabe.")
                 max_rows_int = None
+        # Optional: start number for sequential assignment.  If provided,
+        # each row will be numbered sequentially starting from this value,
+        # overriding automatic recognition.  This can be used as a
+        # fallback when OCR fails on some pages.
+        start_num_input = st.text_input(
+            "Startnummer (optional, falls automatische Erkennung fehlschlägt)", value=""
+        )
+        start_num_int: Optional[int] = None
+        if start_num_input.strip():
+            try:
+                start_num_int = int(start_num_input.strip())
+            except ValueError:
+                st.warning(
+                    "⚠️ 'Startnummer' muss eine Zahl sein. Ignoriere Eingabe für Startnummer."
+                )
+                start_num_int = None
         uploaded_files = st.file_uploader(
             "Seiten als Bilder hochladen",
             type=["png", "jpg", "jpeg", "webp"],
@@ -613,15 +653,21 @@ def main() -> None:
                 margin_vertical=20,
                 margin_horizontal=40,
             )
-            for (crop, number) in rows:
+            for idx, (crop, number) in enumerate(rows, start=1):
                 # Normalise the test name for filenames
                 safe_test = untertest.replace(" ", "_")
                 safe_set = set_text.replace(" ", "_")
-                # Build filename using recognised task number; fall back to counter if needed
-                if number and '?' not in number:
-                    filename = f"{safe_test}_Set-{safe_set}_Task-{number}_Solution.png"
+                # Determine task identifier: either sequential from start_num_int
+                # or the recognised number (if not containing '?').  If both
+                # are unavailable, fall back to index.
+                task_id: Optional[str] = None
+                if start_num_int is not None:
+                    task_id = f"{start_num_int + idx - 1:02d}"
+                elif number and '?' not in number:
+                    task_id = number
                 else:
-                    filename = f"{safe_test}_Set-{safe_set}_Task-{len(out_imgs)+1:02d}_Solution.png"
+                    task_id = f"{idx:02d}"
+                filename = f"{safe_test}_Set-{safe_set}_Task-{task_id}_Solution.png"
                 out_imgs.append((filename, crop))
         if not out_imgs:
             st.warning("Keine Reihen erkannt. Prüfe das Layout und versuche es erneut.")
