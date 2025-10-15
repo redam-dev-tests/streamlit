@@ -369,27 +369,25 @@ def _heuristic_classify_digit(feats: Dict[str, float]) -> str:
         # 4 tends to be wide
         if aspect > 0.72:
             return "4"
-        # If bottom is heavier than top it's likely a 6
-        if ratio < 0.45:
+        # 6 usually has a heavier lower half; ratio lower than ~0.50
+        if ratio < 0.50:
             return "6"
-        # Between 0 and 9: 9 is slightly denser
-        if fill > 0.66:
+        # 9 is slightly denser overall than 0; empirically fill above ~0.63
+        if fill > 0.63:
             return "9"
-        else:
-            return "0"
+        return "0"
     # No holes: 1, 2, 3, 5 or 7
     # Very slender => 1
     if aspect < 0.50:
         return "1"
     # Top heavy => 7
-    if ratio > 0.60:
+    if ratio > 0.65:
         return "7"
-    # Distinguish 2, 3 and 5 using fill and ratio
-    # 5 typically has a larger upper mass than 2 or 3
-    if ratio > 0.52:
+    # Distinguish 5 using slightly higher top ratio
+    if ratio > 0.54:
         return "5"
-    # 2 and 3 share similar aspect; 2 often has slightly lower top ratio
-    if ratio < 0.47:
+    # Distinguish 2: lower top ratio implies 2
+    if ratio < 0.49:
         return "2"
     # Otherwise default to 3
     return "3"
@@ -443,7 +441,7 @@ def _classify_digit_image(digit_img: np.ndarray) -> str:
     # Template matching
     digit_tm, score = _match_template_digit(submask)
     # If the best template match is reasonably confident, use it
-    if score >= 0.45 and digit_tm != "?":
+    if score >= 0.40 and digit_tm != "?":
         return digit_tm
     # Otherwise fall back to shape-based heuristics
     feats = _digit_features(digit_img)
